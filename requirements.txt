@@ -1,0 +1,16 @@
+streamlit
+requests
+pandas
+numpy
+sentence-transformers
+faiss-cpu
+transformers
+torch
+pymupdf
+pdfplumber
+pdfminer.six
+pypdf
+openpyxl
+xlsxwriter
+apscheduler
+pytz
