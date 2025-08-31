@@ -14,3 +14,17 @@ openpyxl
 xlsxwriter
 apscheduler
 pytz
+streamlit
+requests
+pandas
+PyMuPDF
+pdfplumber
+pdfminer.six
+pypdf
+pdf2image
+pytesseract
+numpy
+scikit-learn
+openai>=1.0.0
+tqdm
+
