@@ -1,185 +1,50 @@
-import os, io, re, time, json, datetime as dt
-from pathlib import Path
+from textwrap import dedent
+import os
+
+base_dir = "/mnt/data"
+os.makedirs(base_dir, exist_ok=True)
+
+streamlit_app = dedent(r"""
+import os, io, re, time, json, math
+from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 import pandas as pd
 import numpy as np
-import streamlit as st
 
-# IR / NLP
-from sentence_transformers import SentenceTransformer
-import faiss
-from transformers import pipeline
-
-# PDF stack (pure pip — OK on Streamlit Cloud)
 import fitz  # PyMuPDF
 import pdfplumber
 from pdfminer.high_level import extract_text as pdfminer_extract_text
 from pypdf import PdfReader
+from pdf2image import convert_from_bytes
+import pytesseract
 
-# Scheduler
-from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.cron import CronTrigger
-import pytz
+import streamlit as st
 
-# =========================
-# Config & constants
-# =========================
-st.set_page_config(page_title="BSE Company Update – AI Agent", layout="wide")
-IST = pytz.timezone("Asia/Kolkata")
+# ============================
+# Page setup
+# ============================
+st.set_page_config(page_title="BSE Special Situations Agent", layout="wide")
+st.title("📈 BSE Special Situations — Agentic AI")
+st.caption("Filters daily announcements for special situations, extracts PDFs, and summarizes via non-LLM or LLM.")
 
-DATA_DIR = Path("storage")
-DATA_DIR.mkdir(exist_ok=True)
-PARQUET_PATH = DATA_DIR / "bse_company_update.parquet"
-CONFIG_PATH = DATA_DIR / "config.json"
-
-BSE_BASE_PAGE = "https://www.bseindia.com/corporates/ann.html"
-BSE_API = "https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w"
-ATTACH_BASES = [
-    "https://www.bseindia.com/xml-data/corpfiling/AttachHis/",
-    "https://www.bseindia.com/xml-data/corpfiling/Attach/",
-    "https://www.bseindia.com/xml-data/corpfiling/AttachLive/",
-]
-ILLEGAL_XML_RX = re.compile(r'[\x00-\x08\x0B-\x0C\x0E-\x1F\x7F]')
-
+# ============================
+# Utilities
+# ============================
+_ILLEGAL_RX = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
 def _clean(s: str) -> str:
-    return ILLEGAL_XML_RX.sub("", s) if isinstance(s, str) else s
-
-def _norm(s: str) -> str:
-    return re.sub(r"\s+", " ", str(s or "")).strip().lower()
+    return _ILLEGAL_RX.sub('', s) if isinstance(s, str) else s
 
 def _first_col(df: pd.DataFrame, names):
     for n in names:
-        if n in df.columns:
-            return n
+        if n in df.columns: return n
     return None
 
-def _now_ist():
-    return dt.datetime.now(IST)
+def _norm(s): 
+    return re.sub(r"\s+", " ", str(s or "")).strip().lower()
 
-# =========================
-# Fetch announcements (PDF-free)
-# =========================
-def fetch_bse_announcements_strict(start_yyyymmdd: str,
-                                   end_yyyymmdd: str,
-                                   request_timeout: int = 25,
-                                   verbose: bool = False) -> pd.DataFrame:
-    assert len(start_yyyymmdd) == 8 and len(end_yyyymmdd) == 8
-    assert start_yyyymmdd <= end_yyyymmdd
-
-    s = requests.Session()
-    s.headers.update({
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": BSE_BASE_PAGE,
-        "X-Requested-With": "XMLHttpRequest",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-    })
-    try:
-        s.get(BSE_BASE_PAGE, timeout=15)
-    except Exception:
-        pass
-
-    variants = [
-        {"subcategory": "-1", "strSearch": "P"},
-        {"subcategory": "-1", "strSearch": ""},
-        {"subcategory": "",   "strSearch": "P"},
-        {"subcategory": "",   "strSearch": ""},
-    ]
-
-    all_rows = []
-    for v in variants:
-        params = {
-            "pageno": 1,
-            "strCat": "-1",
-            "subcategory": v["subcategory"],
-            "strPrevDate": start_yyyymmdd,
-            "strToDate": end_yyyymmdd,
-            "strSearch": v["strSearch"],
-            "strscrip": "",
-            "strType": "C",
-        }
-        rows, total, page = [], None, 1
-        while True:
-            r = s.get(BSE_API, params=params, timeout=request_timeout)
-            ct = r.headers.get("content-type", "")
-            if "application/json" not in ct:
-                if verbose: st.info(f"Non-JSON on page {page} for variant {v}.")
-                break
-            data = r.json()
-            table = data.get("Table") or []
-            rows.extend(table)
-            if total is None:
-                try:
-                    total = int((data.get("Table1") or [{}])[0].get("ROWCNT") or 0)
-                except Exception:
-                    total = None
-            if not table:
-                break
-            params["pageno"] += 1
-            page += 1
-            time.sleep(0.25)
-            if total and len(rows) >= total:
-                break
-        if rows:
-            all_rows = rows
-            break
-
-    if not all_rows:
-        return pd.DataFrame()
-
-    all_keys = set()
-    for r in all_rows:
-        all_keys.update(r.keys())
-    return pd.DataFrame(all_rows, columns=list(all_keys))
-
-# =========================
-# Filter: Category + (optional) ticker/company
-# =========================
-def filter_by_category(df: pd.DataFrame, category_filter="Company Update") -> pd.DataFrame:
-    if df.empty:
-        return df
-    cat_col = _first_col(df, ["CATEGORYNAME","CATEGORY","NEWS_CAT","NEWSCATEGORY","NEWS_CATEGORY"])
-    if not cat_col:
-        return df  # cannot filter without category column
-    out = df.copy()
-    out["_cat_norm"] = out[cat_col].map(_norm)
-    out = out.loc[out["_cat_norm"] == _norm(category_filter)].drop(columns=["_cat_norm"])
-    return out
-
-def apply_company_filters(df: pd.DataFrame,
-                          scrip_codes: str = "",
-                          company_keywords: str = "",
-                          exact_company: bool = False) -> pd.DataFrame:
-    if df.empty:
-        return df
-    out = df.copy()
-
-    if scrip_codes.strip():
-        codes = {c.strip() for c in re.split(r"[,\s]+", scrip_codes.strip()) if c.strip()}
-        sc_col = _first_col(out, ["SCRIP_CD","SCRIPCODE","BSE_CODE"])
-        if sc_col:
-            out = out[out[sc_col].astype(str).isin(codes)]
-
-    if company_keywords.strip():
-        keys = [k.strip() for k in company_keywords.split(",") if k.strip()]
-        name_col = _first_col(out, ["SLONGNAME","SNAME","COMPANY","COMPANYNAME"])
-        if name_col:
-            if exact_company:
-                targets = {_norm(k) for k in keys}
-                out = out[out[name_col].map(lambda x: _norm(x) in targets)]
-            else:
-                pat = "|".join([re.escape(k) for k in keys])
-                out = out[out[name_col].str.contains(pat, case=False, na=False, regex=True)]
-
-    return out
-
-# =========================
-# PDF text + tables extraction (no OCR in Cloud)
-# =========================
+# ---------- robust PDF text + tables extraction ----------
 def _text_pymupdf(pdf_bytes: bytes) -> str:
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -230,7 +95,14 @@ def _tables_pdfplumber(pdf_bytes: bytes, max_pages: int = 6) -> str:
     except Exception:
         return ""
 
-def extract_text_and_tables(pdf_bytes: bytes) -> str:
+def _ocr_first_pages(pdf_bytes: bytes, max_pages: int = 3) -> str:
+    try:
+        imgs = convert_from_bytes(pdf_bytes, dpi=200, first_page=1, last_page=max_pages)
+        return "\n".join((pytesseract.image_to_string(im) or "") for im in imgs).strip()
+    except Exception:
+        return ""
+
+def _extract_text_and_tables(pdf_bytes: bytes, use_ocr=True, ocr_pages=3) -> str:
     text = _text_pymupdf(pdf_bytes)
     if len(text) < 120:
         alt = _text_pdfminer(pdf_bytes)
@@ -240,52 +112,71 @@ def extract_text_and_tables(pdf_bytes: bytes) -> str:
         if len(alt) > len(text): text = alt
 
     tables_md = _tables_pdfplumber(pdf_bytes, max_pages=6)
+    if len(text) < 80 and not tables_md and use_ocr:
+        ocr = _ocr_first_pages(pdf_bytes, max_pages=ocr_pages)
+        if len(ocr) > len(text): text = ocr
 
     combo = text.strip()
     if tables_md:
         combo = (combo + "\n\n---\n# Extracted Tables (Markdown)\n" + tables_md).strip()
     return _clean(combo)
 
-def candidate_urls(row: pd.Series):
+# ---------- attachment URL candidates ----------
+def _candidate_urls(row):
     cands = []
     att = str(row.get("ATTACHMENTNAME") or "").strip()
     if att:
-        for base in ATTACH_BASES:
-            cands.append(base + att)
+        cands += [
+            f"https://www.bseindia.com/xml-data/corpfiling/AttachHis/{att}",
+            f"https://www.bseindia.com/xml-data/corpfiling/Attach/{att}",
+            f"https://www.bseindia.com/xml-data/corpfiling/AttachLive/{att}",
+        ]
     ns = str(row.get("NSURL") or "").strip()
     if ".pdf" in ns.lower():
         cands.append(ns if ns.lower().startswith("http") else "https://www.bseindia.com/" + ns.lstrip("/"))
+    # de-dupe
     seen, out = set(), []
     for u in cands:
         if u and u not in seen:
             out.append(u); seen.add(u)
     return out
 
-def fetch_pdf_text_for_df(df_filtered: pd.DataFrame,
-                          max_workers=10,
-                          request_timeout=25,
-                          verbose=False) -> pd.DataFrame:
+# ---------- step 3: read PDFs ONLY for the filtered rows ----------
+def fetch_pdf_text_for_df(
+    df_filtered: pd.DataFrame,
+    use_ocr: bool = True,
+    ocr_pages: int = 3,
+    max_workers: int = 10,
+    request_timeout: int = 25,
+    verbose: bool = True,
+) -> pd.DataFrame:
+    '''Assumes df_filtered is already filtered. Adds pdf_url + original_text.'''
     work = df_filtered.copy()
     if work.empty:
         work["pdf_url"] = ""
         work["original_text"] = ""
         return work
 
+    # Warm session once
+    base_page = "https://www.bseindia.com/corporates/ann.html"
     s = requests.Session()
     s.headers.update({
         "User-Agent": "Mozilla/5.0",
         "Accept": "application/pdf,application/octet-stream,*/*",
-        "Referer": BSE_BASE_PAGE,
+        "Referer": base_page,
         "Accept-Language": "en-US,en;q=0.9",
     })
     try:
-        s.get(BSE_BASE_PAGE, timeout=15)
+        s.get(base_page, timeout=15)
     except Exception:
         pass
 
-    url_lists = [candidate_urls(row) for _, row in work.iterrows()]
+    url_lists = [_candidate_urls(row) for _, row in work.iterrows()]
     work["pdf_url"] = ""
     work["original_text"] = ""
+
+    if verbose:
+        st.write(f"PDF candidates for {len(url_lists)} filtered rows; fetching…")
 
     def worker(i, urls):
         for u in urls:
@@ -296,7 +187,7 @@ def fetch_pdf_text_for_df(df_filtered: pd.DataFrame,
                     pdf_bytes = r.content
                     head_ok = pdf_bytes[:8].startswith(b"%PDF")
                     if ("pdf" in ctype) or head_ok or u.lower().endswith(".pdf"):
-                        txt = extract_text_and_tables(pdf_bytes)
+                        txt = _extract_text_and_tables(pdf_bytes, use_ocr=use_ocr, ocr_pages=ocr_pages)
                         if len(txt) >= 10:
                             return i, u, txt
             except Exception:
@@ -312,336 +203,472 @@ def fetch_pdf_text_for_df(df_filtered: pd.DataFrame,
                 work.at[idx, "pdf_url"] = u
                 work.at[idx, "original_text"] = txt
 
+    # Excel-safe
     for col in ["original_text","HEADLINE","NEWSSUB"]:
         if col in work.columns:
             work[col] = work[col].map(_clean)
+    if verbose:
+        st.success(f"Filled original_text for {(work['original_text'].str.len()>=10).sum()} of {len(work)} rows.")
     return work
 
-# =========================
-# Chunking / Embeddings / FAISS
-# =========================
-def chunk_text(text: str, max_chars=1200, overlap=200):
-    s = re.sub(r"\s+", " ", text or "").strip()
-    if not s:
-        return []
-    chunks, i = [], 0
-    while i < len(s):
-        j = min(i + max_chars, len(s))
-        k = s.rfind(". ", max(i + max(200, max_chars-300), i), j)
-        if k == -1: k = j
-        chunks.append(s[i:k].strip())
-        if k == j and j >= len(s): break
-        i = max(0, k - overlap)
-        if i <= 0: i = k
-    return [c for c in chunks if len(c) > 20]
+# ---------- BSE fetch (strict) ----------
+def fetch_bse_announcements_strict(start_yyyymmdd: str,
+                                   end_yyyymmdd: str,
+                                   verbose: bool = True,
+                                   request_timeout: int = 25) -> pd.DataFrame:
+    '''
+    Fetch BSE corporate announcements for a date range (inclusive) with robust session warming
+    and parameter variants. This function DOES NOT touch PDFs. It only returns the raw rows.
+    '''
+    assert len(start_yyyymmdd) == 8 and len(end_yyyymmdd) == 8
+    assert start_yyyymmdd <= end_yyyymmdd
 
-@st.cache_resource(show_spinner=False)
-def load_embedder():
-    return SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+    base_page = "https://www.bseindia.com/corporates/ann.html"
+    url = "https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w"
 
-@st.cache_resource(show_spinner=False)
-def load_summarizer():
-    # smaller, cloud-friendly summarizer
-    return pipeline("summarization", model="sshleifer/distilbart-cnn-12-6")
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": base_page,
+        "X-Requested-With": "XMLHttpRequest",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    })
 
-def build_index(df_docs: pd.DataFrame):
-    if df_docs.empty:
-        return None, None, None
-    rows = []
-    for i, r in df_docs.iterrows():
-        text = str(r.get("original_text") or "")
-        meta = {
-            "row_id": i,
-            "company": str(r.get("SLONGNAME") or ""),
-            "headline": str(r.get("HEADLINE") or r.get("NEWSSUB") or ""),
-            "date": str(r.get("NEWS_DT") or ""),
-            "pdf_url": str(r.get("pdf_url") or ""),
-            "scrip": str(r.get("SCRIP_CD") or ""),
-        }
-        for j, c in enumerate(chunk_text(text, 1200, 200)):
-            rows.append({"chunk_text": c, **meta, "chunk_id": f"{i}_{j}"})
-    if not rows:
-        return None, None, None
-    df_chunks = pd.DataFrame(rows)
-    embedder = load_embedder()
-    X = embedder.encode(df_chunks["chunk_text"].tolist(), show_progress_bar=False, normalize_embeddings=True).astype("float32")
-    index = faiss.IndexFlatIP(X.shape[1])
-    index.add(X)
-    return df_chunks, index, X
-
-def retrieve(df_chunks, index, query, top_k=6):
-    if df_chunks is None or index is None:
-        return pd.DataFrame()
-    qvec = load_embedder().encode([query], normalize_embeddings=True).astype("float32")
-    D, I = index.search(qvec, top_k)
-    if I.size == 0:
-        return pd.DataFrame()
-    hits = df_chunks.iloc[I[0]].copy()
-    hits["score"] = D[0]
-    return hits
-
-def answer_with_citations(hits: pd.DataFrame, question: str):
-    if hits is None or hits.empty:
-        return "No relevant context found for this question in the selected range/filters.", []
-    context = " ".join(hits["chunk_text"].tolist())
-    summarizer = load_summarizer()
+    # Warm up the corporates page so cookies are set
     try:
-        ans = summarizer(
-            f"Answer concisely based only on the context. Note uncertainty if needed.\n\n"
-            f"Question: {question}\n\nContext:\n{context}",
-            max_length=220, min_length=100, do_sample=False
-        )[0]["summary_text"]
-    except Exception:
-        ans = context[:1000]
-    cits = hits[["row_id","company","headline","date","scrip","pdf_url"]].drop_duplicates("row_id").to_dict("records")
-    return ans, cits
-
-# =========================
-# Storage (append & dedupe)
-# =========================
-def append_and_save_parquet(df_new: pd.DataFrame, path: Path = PARQUET_PATH):
-    if df_new.empty:
-        return load_all_docs()
-    cols = sorted(df_new.columns)
-    if path.exists():
-        old = pd.read_parquet(path)
-        allc = sorted(set(old.columns) | set(cols))
-        old = old.reindex(columns=allc)
-        df_new = df_new.reindex(columns=allc)
-        key_cols = [c for c in ["ATTACHMENTNAME","NSURL","NEWS_DT","SCRIP_CD"] if c in allc]
-        merged = pd.concat([old, df_new], ignore_index=True)
-        if key_cols:
-            merged["_key"] = merged[key_cols].astype(str).agg("|".join, axis=1)
-            merged = merged.drop_duplicates("_key").drop(columns=["_key"])
-        merged.to_parquet(path, index=False)
-        return merged
-    else:
-        df_new.to_parquet(path, index=False)
-        return df_new
-
-def load_all_docs(path: Path = PARQUET_PATH) -> pd.DataFrame:
-    if path.exists():
-        return pd.read_parquet(path)
-    return pd.DataFrame()
-
-# =========================
-# Excel export (in-memory)
-# =========================
-def df_to_excel_download(df: pd.DataFrame, filename: str = "bse_company_update.xlsx"):
-    if df.empty:
-        return None
-    safe = df.replace({r'[\x00-\x08\x0B-\x0C\x0E-\x1F]': ''}, regex=True).copy()
-    if "original_text" in safe.columns:
-        safe["original_text"] = safe["original_text"].astype(str).str.slice(0, 32760)
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
-        safe.to_excel(w, index=False, sheet_name="data")
-        ws = w.sheets["data"]; wb = w.book
-        wrap = wb.add_format({'text_wrap': True})
-        ws.set_column(0, len(safe.columns)-1, 28)
-        if "original_text" in safe.columns:
-            col_idx = safe.columns.get_loc("original_text")
-            ws.set_column(col_idx, col_idx, 80, wrap)
-    buf.seek(0)
-    return buf
-
-# =========================
-# Scheduler (Cloud caveat: runs while app is active)
-# =========================
-def _save_config(d: dict):
-    CONFIG_PATH.write_text(json.dumps(d, indent=2))
-
-def _load_config() -> dict:
-    if CONFIG_PATH.exists():
-        return json.loads(CONFIG_PATH.read_text())
-    return {}
-
-def daily_pull_job(cfg: dict):
-    try:
-        now = _now_ist()
-        yday = (now - dt.timedelta(days=1)).date()
-        start_s = end_s = yday.strftime("%Y%m%d")
-
-        df_all = fetch_bse_announcements_strict(start_s, end_s, verbose=False)
-        df_cat = filter_by_category(df_all, "Company Update")
-
-        df_f = apply_company_filters(
-            df_cat,
-            scrip_codes=cfg.get("scrip_codes",""),
-            company_keywords=cfg.get("company_keywords",""),
-            exact_company=cfg.get("exact_company", False),
-        )
-
-        if df_f.empty:
-            return {"status":"ok","fetched":0,"docs":0}
-
-        df_docs = fetch_pdf_text_for_df(
-            df_f,
-            max_workers=cfg.get("max_workers", 8),
-            verbose=False
-        )
-        df_docs = df_docs[(df_docs["original_text"].str.len() >= 10)]
-        if df_docs.empty:
-            return {"status":"ok","fetched":len(df_f),"docs":0}
-
-        merged = append_and_save_parquet(df_docs)
-        return {"status":"ok","fetched":len(df_f),"docs":len(df_docs),"store_rows":len(merged)}
-    except Exception as e:
-        return {"status":"error","error":str(e)}
-
-@st.cache_resource(show_spinner=False)
-def get_scheduler():
-    sched = BackgroundScheduler(timezone=IST)
-    sched.start(paused=True)
-    return sched
-
-def ensure_daily_job(enabled: bool, hour: int, minute: int, cfg: dict):
-    sched = get_scheduler()
-    job_id = "daily_bse_pull"
-    try:
-        j = sched.get_job(job_id)
-        if j: sched.remove_job(job_id)
+        s.get(base_page, timeout=15)
     except Exception:
         pass
-    if enabled:
-        trigger = CronTrigger(hour=hour, minute=minute, timezone=IST)
-        sched.add_job(lambda: daily_pull_job(cfg), trigger=trigger, id=job_id, replace_existing=True)
-        sched.resume()
-    else:
-        sched.pause()
 
-# =========================
-# UI
-# =========================
-st.title("🧠 BSE Company Update – AI Agent (Streamlit Cloud)")
-st.caption("Filter by date/ticker/company • Parse PDFs (text + tables) • Ask questions • Export Excel. (OCR disabled on Cloud)")
+    # Variants
+    variants = [
+        {"subcategory": "-1", "strSearch": "P"},
+        {"subcategory": "-1", "strSearch": ""},
+        {"subcategory": "",   "strSearch": "P"},
+        {"subcategory": "",   "strSearch": ""},
+    ]
 
-with st.sidebar:
-    st.header("1) Date Range")
-    today = _now_ist().date()
-    start = st.date_input("From", value=today, max_value=today)
-    end = st.date_input("To", value=today, min_value=start, max_value=today)
-
-    st.header("2) Filters")
-    scrip_codes = st.text_input("BSE Scrip code(s) (comma/space separated)", value="")
-    company_keywords = st.text_input("Company keyword(s) in name (comma separated)", value="")
-    exact_company = st.checkbox("Exact company name match", value=False)
-
-    st.header("3) Performance")
-    max_workers = st.slider("Parallel downloads", 2, 12, 8)
-
-    run = st.button("Fetch & Build Corpus")
-
-    st.markdown("---")
-    st.header("Daily Auto-Pull (while app is running)")
-    sched_cfg = _load_config()
-    sched_enable = st.checkbox("Enable daily pull", value=sched_cfg.get("sched_enable", False))
-    sched_time = st.time_input("Run time (IST)", value=dt.time(7, 0))
-    if st.button("Apply Scheduler"):
-        cfg = {
-            "sched_enable": bool(sched_enable),
-            "sched_hour": int(sched_time.hour),
-            "sched_min": int(sched_time.minute),
-            "scrip_codes": scrip_codes,
-            "company_keywords": company_keywords,
-            "exact_company": bool(exact_company),
-            "max_workers": int(max_workers),
+    all_rows = []
+    for v in variants:
+        params = {
+            "pageno": 1,
+            "strCat": "-1",
+            "subcategory": v["subcategory"],
+            "strPrevDate": start_yyyymmdd,
+            "strToDate": end_yyyymmdd,
+            "strSearch": v["strSearch"],
+            "strscrip": "",
+            "strType": "C",    # Equity
         }
-        _save_config(cfg)
-        ensure_daily_job(cfg["sched_enable"], cfg["sched_hour"], cfg["sched_min"], cfg)
-        st.success(f"Scheduler {'enabled' if cfg['sched_enable'] else 'disabled'} for {sched_time.strftime('%H:%M')} IST.")
 
-# state
-for key in ["df_all","df_filtered","df_docs","chunks","faiss"]:
-    if key not in st.session_state: st.session_state[key] = pd.DataFrame() if key.startswith("df_") else None
+        rows, total, page = [], None, 1
+        while True:
+            r = s.get(url, params=params, timeout=request_timeout)
+            ct = r.headers.get("content-type","")
+            if "application/json" not in ct:
+                if verbose:
+                    st.warning(f"[variant {v}] non-JSON response on page {page} (ct={ct}).")
+                break
 
-if run:
-    start_s = start.strftime("%Y%m%d")
-    end_s = end.strftime("%Y%m%d")
-    with st.spinner("Fetching announcements…"):
-        df_all = fetch_bse_announcements_strict(start_s, end_s, verbose=False)
-        st.session_state.df_all = df_all
+            data = r.json()
+            table = data.get("Table") or []
+            rows.extend(table)
 
-    with st.spinner("Filtering to 'Company Update' + ticker/company…"):
-        df_filtered = filter_by_category(st.session_state.df_all, "Company Update")
-        df_filtered = apply_company_filters(df_filtered, scrip_codes, company_keywords, exact_company)
-        st.session_state.df_filtered = df_filtered
+            if total is None:
+                try:
+                    total = int((data.get("Table1") or [{}])[0].get("ROWCNT") or 0)
+                except Exception:
+                    total = None
 
-    if st.session_state.df_filtered.empty:
-        st.warning("No rows matched filters in this range.")
+            if verbose:
+                msg = f"[variant {v}] page {page}: got {len(table)} (acc {len(rows)})"
+                if total is not None:
+                    msg += f", total {total}"
+                st.write(msg)
+
+            if not table:
+                break
+
+            params["pageno"] += 1
+            page += 1
+            time.sleep(0.3)  # gentle throttle
+            if total and len(rows) >= total:
+                break
+
+        if rows:
+            all_rows = rows
+            break  # stop after first variant that returns data
+
+    if not all_rows:
+        return pd.DataFrame()
+
+    all_keys = set()
+    for r in all_rows:
+        all_keys.update(r.keys())
+    df = pd.DataFrame(all_rows, columns=list(all_keys))
+    return df
+
+# ---------- Simple category filter (BSE-provided column) ----------
+def filter_announcements(
+    df: pd.DataFrame,
+    category_filter = "Company Update"  # str or list/tuple of strs
+) -> pd.DataFrame:
+    if df.empty:
+        return df.copy()
+    if isinstance(category_filter, (list, tuple, set)):
+        targets = { _norm(c) for c in category_filter }
     else:
-        with st.spinner(f"Reading PDFs for {len(st.session_state.df_filtered)} rows…"):
-            df_docs = fetch_pdf_text_for_df(
-                st.session_state.df_filtered,
-                max_workers=max_workers, verbose=False
+        targets = { _norm(category_filter) }
+    cat_col = _first_col(df, ["CATEGORYNAME","CATEGORY","NEWS_CAT","NEWSCATEGORY","NEWS_CATEGORY"])
+    df2 = df.copy()
+    if cat_col:
+        df2["_cat_norm"] = df2[cat_col].map(_norm)
+        out = df2.loc[df2["_cat_norm"].isin(targets)].drop(columns=[c for c in ["_cat_norm"] if c in df2.columns])
+        return out
+    else:
+        return df2
+
+# ============================
+# Special Situations Rules
+# ============================
+SPECIAL_RULES = {
+    "Order/Contract Win": [r"(?i)\b(order|contract|purchase order|bagged|awarded|letter of award|loa|work order|tender)\b"],
+    "M&A / Acquisition / Scheme": [r"(?i)\b(acquisition|acquires?|takeover|merger|demerger|slump sale|scheme of arrangement|amalgamation|de-?merger)\b"],
+    "Fund Raise (Equity)": [r"(?i)\b(preferential allotment|qip|qualified institutions placement|rights issue|bonus issue|ipo|fpo|private placement|warrants?)\b"],
+    "Fund Raise (Debt)": [r"(?i)\b(ncds?|non[- ]?convertible debentures?|term loan|bank loan|ecb|masala bond|commercial paper|cp issuance)\b"],
+    "Default / Delay": [r"(?i)\b(default(?:ed)?|delay in (?:payment|servicing)|wilful defaulter|moratorium)\b"],
+    "Credit Rating": [r"(?i)\b(care|icra|crisil|india ratings|brickwork)\b.*\b(rating|reaffirmed|downgrade|upgrade)\b"],
+    "Pledge / Encumbrance": [r"(?i)\b(pledge|encumbrance|encumbered|release of pledge|invocation)\b"],
+    "Management Changes": [r"(?i)\b(resignation|appointed|appointment|ceo|cfo|cio|director|independent director|company secretary|auditor)\b"],
+    "Auditor / Secretarial": [r"(?i)\b(statutor(?:y|ily) auditor|secretarial auditor|cost auditor|auditor resignation|casual vacancy)\b"],
+    "Litigation / Regulatory": [r"(?i)\b(litigation|arbitration|court|nclt|sebi|income tax|gst|ed\b|cbi\b|raid|enforcement directorate)\b"],
+    "Capex / Capacity": [r"(?i)\b(capex|capital expenditure|capacity (?:expansion|addition|augmentation)|greenfield|brownfield|plant|factory|commission(?:ed|ing))\b"],
+    "Buyback / Dividend": [r"(?i)\b(buy[- ]?back|dividend|interim dividend|final dividend|record date)\b"],
+    "JV / MoU / Partnership": [r"(?i)\b(jv|joint venture|memorandum of understanding|mou|strategic partnership|alliance|collaboration|distribution agreement|supply agreement)\b"],
+    "Subsidiary / Entity": [r"(?i)\b(subsidiar(?:y|ies)|incorporation|wholly owned subsidiary|wos|step[- ]down subsidiary|dissolution|strike off)\b"],
+    "Accident / Force Majeure": [r"(?i)\b(fire|blast|accident|shutdown|outage|flood|cyclone|earthquake|force majeure)\b"],
+    "Product / Approval / IP": [r"(?i)\b(usfda|dcgi|ce mark|drug approval|patent granted|product launch|new product)\b"],
+}
+
+ALL_RULE_NAMES = list(SPECIAL_RULES.keys())
+
+def _classify_rules(text: str) -> list:
+    hits = []
+    for name, pats in SPECIAL_RULES.items():
+        for p in pats:
+            if re.search(p, text or ""):
+                hits.append(name); break
+    return sorted(set(hits))
+
+def _prelim_rule_match(row) -> list:
+    headline = str(row.get("HEADLINE") or "")
+    newssub = str(row.get("NEWSSUB") or "")
+    t = " ".join([headline, newssub])
+    return _classify_rules(t)
+
+def _full_rule_match(row) -> list:
+    headline = str(row.get("HEADLINE") or "")
+    newssub = str(row.get("NEWSSUB") or "")
+    body = str(row.get("original_text") or "")
+    t = " ".join([headline, newssub, body])
+    return _classify_rules(t)
+
+# ============================
+# Summarizers
+# ============================
+def _split_sentences(text: str) -> list:
+    text = re.sub(r"\s+", " ", text or "").strip()
+    sents = re.split(r"(?<=[\.\!\?])\s+(?=[A-Z0-9])", text)
+    if len(sents) < 2:
+        sents = re.split(r"\s*[\n;]\s*", text)
+    return [s for s in sents if len(s) > 20]
+
+def summarize_extractive_tfidf(text: str, max_sentences: int = 3) -> str:
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    sents = _split_sentences(text)
+    if not sents:
+        return (text or "")[:400]
+    if len(sents) <= max_sentences:
+        return " ".join(sents)
+    vec = TfidfVectorizer(stop_words="english", max_features=5000)
+    X = vec.fit_transform(sents)
+    scores = np.asarray(X.sum(axis=1)).ravel()
+    top_idx = np.argsort(scores)[::-1][:max_sentences]
+    top_idx_sorted = sorted(top_idx)
+    return " ".join([sents[i] for i in top_idx_sorted])
+
+def extract_highlights(text: str, top_k: int = 10) -> list:
+    patterns = [
+        r"₹\s?[\d,]+(?:\.\d+)?",
+        r"Rs\.?\s?[\d,]+(?:\.\d+)?\s?(?:crore|million|bn|billion)?",
+        r"\b\d{1,3}(?:,\d{3})+(?:\.\d+)?\b",
+        r"\b\d+(?:\.\d+)?\s?%",
+        r"\bFY\d{2}\b",
+        r"\bFY\d{2}-\d{2}\b",
+        r"\bQ[1-4]FY\d{2}\b",
+        r"\b[A-Z]{2,}(?:\s[A-Z]{2,})+\b",
+    ]
+    found = []
+    for p in patterns:
+        found += re.findall(p, text or "", flags=re.IGNORECASE)
+    out, seen = [], set()
+    for tok in found:
+        key = tok.lower()
+        if key not in seen:
+            out.append(tok); seen.add(key)
+        if len(out) >= top_k: break
+    return out
+
+def llm_summarize(text: str, model: str = "gpt-4o-mini", api_key: str = None, sys_prompt: str = None) -> str:
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY not provided.")
+    sys_prompt = sys_prompt or (
+        "You are an equity research assistant. Summarize the announcement into crisp bullets:\n"
+        "1) What happened, 2) amounts & instruments, 3) timelines & conditions, 4) business/valuation impact, "
+        "5) red flags. Keep it 80-120 words, factual, no hype."
+    )
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=api_key)
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role":"system","content":sys_prompt},
+                    {"role":"user","content":text[:16000]}
+                ],
+                temperature=0.2,
+                max_tokens=300,
             )
-            df_docs = df_docs[(df_docs["original_text"].str.len() >= 10)]
-            st.session_state.df_docs = df_docs
+            return resp.choices[0].message.content.strip()
+        except Exception:
+            resp = client.responses.create(
+                model=model,
+                input=[{"role":"system","content":sys_prompt},{"role":"user","content":text[:16000]}],
+                temperature=0.2,
+                max_output_tokens=300,
+            )
+            out = getattr(resp, "output_text", None)
+            return (out or "").strip()
+    except Exception as e:
+        return f"[LLM error] {e}"
 
-        if st.session_state.df_docs.empty:
-            st.error("No readable PDFs found (many PDFs are scanned; OCR is disabled on Streamlit Cloud).")
+# ============================
+# Streamlit UI — Controls
+# ============================
+with st.sidebar:
+    st.header("⚙️ Controls")
+    today = datetime.now().date()
+    default_start = today - timedelta(days=1)
+    start_date = st.date_input("Start date", value=default_start, max_value=today)
+    end_date = st.date_input("End date", value=today, max_value=today, min_value=start_date)
+
+    use_bse_category = st.checkbox("Filter by BSE 'Company Update' category first", value=False)
+    selected_rules = st.multiselect("Special Situation Types", ALL_RULE_NAMES, default=ALL_RULE_NAMES)
+
+    st.subheader("PDF Extraction")
+    use_ocr = st.checkbox("Enable OCR fallback (slower, better on scanned PDFs)", value=True)
+    ocr_pages = st.slider("OCR pages (first N)", min_value=1, max_value=5, value=3, step=1)
+    max_workers = st.slider("Parallel downloads (PDFs)", 2, 16, value=10)
+
+    st.subheader("Summarization")
+    sum_mode = st.radio("Summarizer", ["Non-LLM (TF-IDF)", "LLM (OpenAI-compatible)"], index=0)
+    api_key = st.text_input("OPENAI_API_KEY (optional)", type="password", value=os.getenv("OPENAI_API_KEY",""))
+    model = st.text_input("Model name", value="gpt-4o-mini")
+    max_items = st.slider("Max announcements to summarize", 10, 400, value=120, step=10)
+    include_unmatched = st.checkbox("Include unmatched announcements for review", value=False)
+
+    run = st.button("🚀 Fetch & Analyze", type="primary")
+
+def _fmt_date(d: datetime.date) -> str:
+    return d.strftime("%Y%m%d")
+
+# ============================
+# Pipeline
+# ============================
+@st.cache_data(show_spinner=False, ttl=60*20)
+def step1_fetch(start_str: str, end_str: str) -> pd.DataFrame:
+    return fetch_bse_announcements_strict(start_str, end_str, verbose=False)
+
+def step2_prelim_filter(df: pd.DataFrame, selected_rule_names: list, use_bse_cat: bool) -> pd.DataFrame:
+    df = df.copy()
+    if use_bse_cat:
+        df = filter_announcements(df, category_filter="Company Update")
+    if df.empty:
+        return df
+    df["rule_hits_pre"] = df.apply(_prelim_rule_match, axis=1)
+    if selected_rule_names:
+        df = df.loc[df["rule_hits_pre"].map(lambda xs: len(set(xs).intersection(set(selected_rule_names)))>0)]
+    return df
+
+def step3_pdf(df: pd.DataFrame) -> pd.DataFrame:
+    return fetch_pdf_text_for_df(df, use_ocr=use_ocr, ocr_pages=ocr_pages, max_workers=max_workers, request_timeout=25, verbose=True)
+
+def step4_classify(df: pd.DataFrame, selected_rule_names: list) -> pd.DataFrame:
+    work = df.copy()
+    if work.empty: return work
+    work["rule_hits"] = work.apply(_full_rule_match, axis=1)
+    if selected_rule_names:
+        mask = work["rule_hits"].map(lambda xs: len(set(xs).intersection(set(selected_rule_names)))>0)
+        if not include_unmatched:
+            work = work.loc[mask]
         else:
-            with st.spinner("Building embeddings & index…"):
-                chunks, index, _ = build_index(st.session_state.df_docs)
-                st.session_state.chunks = chunks
-                st.session_state.faiss = index
-            st.success(f"Ready! {len(st.session_state.df_docs)} documents, {0 if chunks is None else len(chunks)} chunks indexed.")
+            work["_matched"] = mask
+    return work
 
-st.markdown("### Ask a question")
-q = st.text_input("e.g., What acquisitions mention consideration amounts for my filtered companies?")
-topk = st.slider("Top results to consider", 3, 12, 6)
-if st.button("Answer"):
-    if st.session_state.faiss is None or st.session_state.chunks is None:
-        st.warning("Please Fetch & Build Corpus first.")
-    elif not q.strip():
-        st.warning("Please enter a question.")
-    else:
-        with st.spinner("Retrieving and composing answer…"):
-            hits = retrieve(st.session_state.chunks, st.session_state.faiss, q, top_k=topk)
-            ans, cits = answer_with_citations(hits, q)
-        st.subheader("Answer")
-        st.write(ans)
-        st.subheader("Sources")
-        if not cits:
-            st.write("No sources.")
+def _build_context(row: pd.Series) -> str:
+    parts = []
+    for k in ["SLONGNAME","HEADLINE","NEWSSUB","NEWS_DT","CATEGORYNAME","SUBCATEGORYNAME"]:
+        if k in row and str(row[k] or "").strip():
+            parts.append(f"{k}: {row[k]}")
+    if row.get("original_text"):
+        parts.append(row["original_text"][:20000])
+    return "\n".join(parts)
+
+def step5_summarize(df: pd.DataFrame) -> pd.DataFrame:
+    work = df.copy()
+    if work.empty: return work
+    if "NEWS_DT" in work.columns:
+        try:
+            work["_dt"] = pd.to_datetime(work["NEWS_DT"], errors="coerce", dayfirst=False)
+            work = work.sort_values("_dt", ascending=False).drop(columns=["_dt"])
+        except Exception:
+            pass
+    if len(work) > max_items:
+        work = work.head(max_items)
+
+    summaries, highlights, contexts = [], [], []
+    use_llm = (sum_mode.startswith("LLM") and api_key.strip() != "")
+    for _, row in work.iterrows():
+        ctx = _build_context(row)
+        contexts.append(ctx)
+        if use_llm:
+            s = llm_summarize(ctx, model=model.strip(), api_key=api_key.strip())
         else:
-            for c in cits:
-                comp = c.get("company","").strip()
-                head = c.get("headline","").strip()
-                date = c.get("date","").strip()
-                scrip = c.get("scrip","").strip()
-                url  = c.get("pdf_url","").strip()
-                st.markdown(f"- **{comp}** (Scrip: {scrip}) — {head}  \n  _{date}_  •  [PDF]({url})")
+            body = row.get("original_text") or " ".join([str(row.get("HEADLINE") or ""), str(row.get("NEWSSUB") or "")])
+            s = summarize_extractive_tfidf(body, max_sentences=3)
+        summaries.append(s)
+        highlights.append(", ".join(extract_highlights(ctx, top_k=8)))
+    work["summary"] = summaries
+    work["highlights"] = highlights
+    work["context_used"] = contexts
+    return work
 
-st.markdown("---")
-st.markdown("### Parsed announcements")
-if isinstance(st.session_state.df_docs, pd.DataFrame) and not st.session_state.df_docs.empty:
-    cols_show = [c for c in ["SCRIP_CD","SLONGNAME","HEADLINE","NEWS_DT","pdf_url","original_text"] if c in st.session_state.df_docs.columns]
-    st.dataframe(st.session_state.df_docs[cols_show].reset_index(drop=True), use_container_width=True, height=360)
-    # Excel download
-    def df_to_excel_download(df: pd.DataFrame, filename: str = "bse_company_update.xlsx"):
-        if df.empty:
-            return None
-        safe = df.replace({r'[\x00-\x08\x0B-\x0C\x0E-\x1F]': ''}, regex=True).copy()
-        if "original_text" in safe.columns:
-            safe["original_text"] = safe["original_text"].astype(str).str.slice(0, 32760)
-        buf = io.BytesIO()
-        with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
-            safe.to_excel(w, index=False, sheet_name="data")
-            ws = w.sheets["data"]; wb = w.book
-            wrap = wb.add_format({'text_wrap': True})
-            ws.set_column(0, len(safe.columns)-1, 28)
-            if "original_text" in safe.columns:
-                col_idx = safe.columns.get_loc("original_text")
-                ws.set_column(col_idx, col_idx, 80, wrap)
-        buf.seek(0)
-        return buf
-    xls = df_to_excel_download(st.session_state.df_docs)
-    if xls:
-        st.download_button("⬇️ Download Excel", data=xls, file_name="bse_company_update.xlsx",
-                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+def step6_digest_md(df: pd.DataFrame) -> str:
+    if df.empty: return "# No special situations found."
+    cols = df.columns
+    nm = "SLONGNAME" if "SLONGNAME" in cols else _first_col(df, ["SNAME","SC_NAME","COMPANYNAME"]) or "Company"
+    dtcol = "NEWS_DT" if "NEWS_DT" in cols else None
+
+    def _cat(row):
+        xs = row.get("rule_hits") or row.get("rule_hits_pre") or []
+        return ", ".join(xs) if xs else "Unclassified"
+
+    df["__cat__"] = df.apply(_cat, axis=1)
+    groups = df.groupby("__cat__", sort=True)
+
+    lines = ["# BSE Special Situations Digest", ""]
+    for cat, g in groups:
+        lines.append(f"## {cat}")
+        for _, r in g.iterrows():
+            cmp = str(r.get(nm) or "").strip()
+            hd = str(r.get("HEADLINE") or "").strip()
+            dt = str(r.get(dtcol) or "").strip() if dtcol else ""
+            url = str(r.get("pdf_url") or r.get("NSURL") or "").strip()
+            summ = str(r.get("summary") or "").strip()
+            lines.append(f"- **{cmp}** — {dt}")
+            if hd: lines.append(f"  - *{hd}*")
+            if url: lines.append(f"  - PDF: {url}")
+            if summ: lines.append(f"  - {summ}")
+        lines.append("")
+    return "\n".join(lines)
+
+# ============================
+# Run Pipeline on Click
+# ============================
+if run:
+    start_str, end_str = _fmt_date(start_date), _fmt_date(end_date)
+    with st.status("Fetching announcements from BSE…", expanded=True) as status:
+        df_raw = step1_fetch(start_str, end_str)
+        if df_raw.empty:
+            st.error("No rows returned from BSE. Try another date or re-run.")
+            status.update(label="No data", state="error")
+        else:
+            st.write(f"Fetched **{len(df_raw)}** rows.")
+            status.update(label="Fetched announcements", state="running")
+
+    if not df_raw.empty:
+        with st.status("Preliminary rule filtering…", expanded=True) as status:
+            df_pre = step2_prelim_filter(df_raw, selected_rules, use_bse_category)
+            st.write(f"Matched **{len(df_pre)}** rows on HEADLINE/NEWSSUB against selected rules.")
+            status.update(label="Preliminary filtered", state="running")
+
+        if not df_pre.empty:
+            with st.status("Downloading & extracting PDFs…", expanded=True) as status:
+                df_pdf = step3_pdf(df_pre)
+                st.write("Sample PDF URL(s):", df_pdf["pdf_url"].replace("", np.nan).dropna().head(3).tolist())
+                status.update(label="PDFs extracted", state="running")
+
+            with st.status("Final classification from full text…", expanded=True) as status:
+                df_cls = step4_classify(df_pdf, selected_rules)
+                st.write(f"Post-PDF filtering rows: **{len(df_cls)}**")
+                status.update(label="Classified", state="running")
+
+            with st.status("Summarizing…", expanded=True) as status:
+                df_sum = step5_summarize(df_cls)
+                status.update(label="Summarized", state="complete")
+
+            st.subheader("📑 Results")
+            show_cols = [c for c in [
+                "NEWS_DT","SLONGNAME","HEADLINE","CATEGORYNAME","SUBCATEGORYNAME","rule_hits",
+                "highlights","summary","pdf_url","NSURL"
+            ] if c in df_sum.columns]
+            st.dataframe(df_sum[show_cols], use_container_width=True, hide_index=True)
+
+            csv_bytes = df_sum[show_cols].to_csv(index=False).encode("utf-8")
+            st.download_button("⬇️ Download CSV", data=csv_bytes, file_name=f"special_situations_{start_str}_{end_str}.csv", mime="text/csv")
+
+            digest_md = step6_digest_md(df_sum)
+            st.download_button("⬇️ Download Markdown Digest", data=digest_md.encode("utf-8"), file_name=f"digest_{start_str}_{end_str}.md", mime="text/markdown")
+
+            with st.expander("📄 Preview Digest (Markdown)"):
+                st.markdown(digest_md)
+
 else:
-    st.caption("Run a fetch to see parsed documents.")
+    st.info("Set your date range and click **Fetch & Analyze**. Tip: keep OCR on for scanned PDFs, and provide an OpenAI key for LLM summaries if desired.")
+""")
 
-st.markdown("---")
-st.caption("Note: Streamlit Cloud may pause inactive apps; the daily scheduler runs only while the app is active.")
+requirements = dedent("""
+streamlit
+requests
+pandas
+PyMuPDF
+pdfplumber
+pdfminer.six
+pypdf
+pdf2image
+pytesseract
+numpy
+scikit-learn
+tqdm
+openai>=1.0.0
+""")
+
+readme = dedent(r"""
+# BSE Special Situations — Agentic AI (Streamlit)
+
+This app fetches BSE corporate announcements for a chosen date range, filters **special situations** (order wins, M&A, fund raises, pledges, rating changes, litigation, capex, etc.), extracts text from **PDF attachments** (with OCR fallback), and produces **summaries** via either a **non-LLM TF-IDF** method or an **LLM (OpenAI-compatible)** endpoint.
+
+---
+
+## Quickstart (Local)
+
+```bash
+python -m venv .venv && source .venv/bin/activate  # (Windows: .venv\Scripts\activate)
+pip install -r requirements.txt
+# Optional: set your API key for LLM summaries
+export OPENAI_API_KEY=sk-...   # (Windows PowerShell: $Env:OPENAI_API_KEY="sk-...")
+streamlit run streamlit_app.py
