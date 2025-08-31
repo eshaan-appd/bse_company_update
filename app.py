@@ -1,4 +1,4 @@
-import os, io, re, time, shutil, math
+import os, io, re, time, shutil
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -31,20 +31,12 @@ _HAS_TESS_BIN = shutil.which("tesseract") is not None
 
 import streamlit as st
 
-# Optional: OpenAI
-try:
-    from openai import OpenAI
-    _HAS_OPENAI = True
-except Exception:
-    OpenAI = None
-    _HAS_OPENAI = False
-
 # =========================================
 # Streamlit UI
 # =========================================
-st.set_page_config(page_title="BSE Company Update — M&A/JV Filter", layout="wide")
-st.title("📈 BSE Company Update — M&A / Merger / Scheme / JV")
-st.caption("Fetch BSE announcements → filter by Company Update + (Acquisition | Amalgamation/Merger | Scheme of Arrangement | Joint Venture) → read ALL pages → summarize with OpenAI (bullets).")
+st.set_page_config(page_title="BSE Company Update — M&A/JV Filter (NLP only)", layout="wide")
+st.title("📈 BSE Company Update — M&A / Merger / Scheme / JV (NLP)")
+st.caption("Fetch BSE announcements → filter by Company Update + (Acquisition | Amalgamation/Merger | Scheme of Arrangement | Joint Venture) → read ALL pages → summarize with offline NLP bullets.")
 
 # =========================================
 # Small utilities
@@ -65,14 +57,9 @@ def _norm(s):
 # PDF extraction helpers (read ALL pages)
 # =========================================
 def _text_pymupdf_all(pdf_bytes: bytes) -> str:
-    """Extract full-document text with PyMuPDF (page by page)."""
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        parts = []
-        for p in doc:
-            # 'text' preserves layout reasonably; 'blocks' could over-fragment
-            parts.append(p.get_text("text") or "")
-        return "\n".join(parts).strip()
+        return "\n".join((p.get_text("text") or "") for p in doc).strip()
     except Exception:
         return ""
 
@@ -97,7 +84,7 @@ def _text_pypdf_all(pdf_bytes: bytes) -> str:
         return ""
 
 def _tables_pdfplumber_all(pdf_bytes: bytes) -> str:
-    """Extract tables from ALL pages as Markdown (may be slow on very large PDFs)."""
+    """Extract tables from ALL pages as Markdown."""
     try:
         tables_md = []
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
@@ -138,7 +125,6 @@ def extract_pdf_fulltext(pdf_bytes: bytes, use_ocr=True, ocr_max_pages: int | No
     If digital text is scarce, OCR the whole doc (or up to ocr_max_pages).
     """
     text = _text_pymupdf_all(pdf_bytes)
-    # fallbacks to gather more content
     alt = _text_pdfminer_all(pdf_bytes)
     if len(alt) > len(text): text = alt
     alt = _text_pypdf_all(pdf_bytes)
@@ -251,14 +237,12 @@ def fetch_bse_announcements_strict(start_yyyymmdd: str,
                                    end_yyyymmdd: str,
                                    verbose: bool = True,
                                    request_timeout: int = 25) -> pd.DataFrame:
-    """
-    Fetches raw announcements, then applies your exact filters:
-    (1) Category = 'Company Update'
-    (2) Sub-category contains any of: Acquisition | Amalgamation / Merger | Scheme of Arrangement | Joint Venture
+    """Fetches raw announcements, then filters:
+    Category='Company Update' AND subcategory contains any:
+    Acquisition | Amalgamation / Merger | Scheme of Arrangement | Joint Venture
     """
     assert len(start_yyyymmdd) == 8 and len(end_yyyymmdd) == 8
     assert start_yyyymmdd <= end_yyyymmdd
-
     base_page = "https://www.bseindia.com/corporates/ann.html"
     url = "https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w"
 
@@ -288,183 +272,159 @@ def fetch_bse_announcements_strict(start_yyyymmdd: str,
     all_rows = []
     for v in variants:
         params = {
-            "pageno": 1,
-            "strCat": "-1",
-            "subcategory": v["subcategory"],
-            "strPrevDate": start_yyyymmdd,
-            "strToDate": end_yyyymmdd,
-            "strSearch": v["strSearch"],
-            "strscrip": "",
-            "strType": "C",
+            "pageno": 1, "strCat": "-1", "subcategory": v["subcategory"],
+            "strPrevDate": start_yyyymmdd, "strToDate": end_yyyymmdd,
+            "strSearch": v["strSearch"], "strscrip": "", "strType": "C",
         }
-
         rows, total, page = [], None, 1
         while True:
             r = s.get(url, params=params, timeout=request_timeout)
             ct = r.headers.get("content-type","")
             if "application/json" not in ct:
-                if verbose:
-                    st.warning(f"[variant {v}] non-JSON response on page {page} (ct={ct}).")
+                if verbose: st.warning(f"[variant {v}] non-JSON on page {page} (ct={ct}).")
                 break
-
             data = r.json()
             table = data.get("Table") or []
             rows.extend(table)
-
             if total is None:
-                try:
-                    total = int((data.get("Table1") or [{}])[0].get("ROWCNT") or 0)
-                except Exception:
-                    total = None
-
+                try: total = int((data.get("Table1") or [{}])[0].get("ROWCNT") or 0)
+                except Exception: total = None
             if not table: break
-            params["pageno"] += 1
-            page += 1
-            time.sleep(0.25)
+            params["pageno"] += 1; page += 1; time.sleep(0.25)
             if total and len(rows) >= total: break
-
         if rows:
-            all_rows = rows
-            break
+            all_rows = rows; break
 
-    if not all_rows:
-        return pd.DataFrame()
+    if not all_rows: return pd.DataFrame()
 
     # Build DF
     all_keys = set()
-    for r in all_rows:
-        all_keys.update(r.keys())
+    for r in all_rows: all_keys.update(r.keys())
     df = pd.DataFrame(all_rows, columns=list(all_keys))
 
-    # ======== YOUR EXACT FILTERS (copy-paste friendly) ========
-    # Helper: BSE category filter
+    # Filter: Company Update + M&A/Merger/Scheme/JV in subcategory fields
     def filter_announcements(df_in: pd.DataFrame, category_filter="Company Update") -> pd.DataFrame:
         if df_in.empty: return df_in.copy()
         cat_col = _first_col(df_in, ["CATEGORYNAME","CATEGORY","NEWS_CAT","NEWSCATEGORY","NEWS_CATEGORY"])
         if not cat_col: return df_in.copy()
         df2 = df_in.copy()
         df2["_cat_norm"] = df2[cat_col].map(lambda x: _norm(x).lower())
-        out = df2.loc[df2["_cat_norm"] == _norm(category_filter).lower()].drop(columns=["_cat_norm"])
-        return out
+        return df2.loc[df2["_cat_norm"] == _norm(category_filter).lower()].drop(columns=["_cat_norm"])
 
-    # 1) Only "Company Update"
     df_filtered = filter_announcements(df, category_filter="Company Update")
-
-    # 2) Sub-category text match across common fields (STRICT)
     df_filtered = df_filtered.loc[
         df_filtered.filter(["NEWSSUB","SUBCATEGORY","SUBCATEGORYNAME","NEWS_SUBCATEGORY","NEWS_SUB"], axis=1)
         .astype(str)
         .apply(lambda col: col.str.contains(r"(Acquisition|Amalgamation\s*/\s*Merger|Scheme of Arrangement|Joint Venture)", case=False, na=False))
         .any(axis=1)
     ]
-    # ==========================================================
-
     return df_filtered
 
 # =========================================
-# Summarizers
+# NLP Summarizer (non-LLM)
 # =========================================
+_SENT_SPLIT = re.compile(r"(?<=[\.\!\?])\s+(?=[A-Z0-9])")
+
+KEY_VERBS = re.compile(r"\b(acquir|purchase|merg|amalgamat|scheme|demerg|slump\s+sale|joint\s+venture|jv|arrangement|investment|subscribe|allot)\w*\b", re.I)
+MONEY_RX  = re.compile(r"(₹\s?[\d,]+(?:\.\d+)?\s*(?:crore|cr|lakh|mn|million|bn|billion)?|Rs\.?\s?[\d,]+(?:\.\d+)?\s*(?:crore|cr|mn|million|bn|billion)?)", re.I)
+PCT_RX    = re.compile(r"\b\d{1,3}(?:\.\d+)?\s?%\b")
+DATE_RX   = re.compile(r"\b(?:\d{1,2}\s*(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\s*\d{2,4}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|FY\d{2}(?:-\d{2})?|Q[1-4]FY\d{2})\b", re.I)
+APPROVAL_RX = re.compile(r"\b(SEBI|NCLT|CCI|RBI|stock\s+exchange|shareholder|board|creditor)s?\b", re.I)
+CONSID_RX = re.compile(r"\b(cash|equity\s+shares?|preference\s+shares?|share\s+swap|debentures?|NCDs?|warrants?)\b", re.I)
+COMPANY_LIKE_RX = re.compile(r"\b([A-Z][A-Za-z0-9&\.\-]*(?:\s+[A-Z][A-Za-z0-9&\.\-]*)*\s+(?:Limited|Ltd\.?|LLP|Private\s+Limited|Pvt\.?\s+Ltd\.?|Inc\.?|LLC|PLC|AG|SA))\b")
+
+from sklearn.feature_extraction.text import TfidfVectorizer
+
 def _split_sentences(text: str) -> list:
     text = re.sub(r"\s+", " ", text or "").strip()
-    sents = re.split(r"(?<=[\.\!\?])\s+(?=[A-Z0-9])", text)
+    sents = _SENT_SPLIT.split(text)
     if len(sents) < 2:
         sents = re.split(r"\s*[\n;]\s*", text)
     return [s for s in sents if len(s) > 20]
 
-def summarize_extractive_tfidf(text: str, max_sentences: int = 4) -> str:
-    from sklearn.feature_extraction.text import TfidfVectorizer
-    sents = _split_sentences(text)
+def _rank_sentences_tfidf(sents: list[str]) -> list[int]:
     if not sents:
-        return (text or "")[:600]
-    if len(sents) <= max_sentences:
-        return " ".join(sents)
-    vec = TfidfVectorizer(stop_words="english", max_features=5000)
+        return []
+    vec = TfidfVectorizer(stop_words="english", max_features=8000)
     X = vec.fit_transform(sents)
-    scores = np.asarray(X.sum(axis=1)).ravel()
-    top_idx = np.argsort(scores)[::-1][:max_sentences]
-    return " ".join([sents[i] for i in sorted(top_idx)])
+    base = np.asarray(X.sum(axis=1)).ravel()
+    # Boost for sentences containing key verbs, numbers, approvals, etc.
+    boosts = []
+    for s in sents:
+        b = 0.0
+        if KEY_VERBS.search(s): b += 1.2
+        if MONEY_RX.search(s):  b += 0.8
+        if PCT_RX.search(s):    b += 0.6
+        if APPROVAL_RX.search(s): b += 0.5
+        if DATE_RX.search(s):   b += 0.4
+        if CONSID_RX.search(s): b += 0.4
+        boosts.append(b)
+    boosts = np.array(boosts)
+    scores = base + boosts
+    return list(np.argsort(scores)[::-1])
 
-def _chunk_text(text: str, chunk_chars: int = 15000, overlap: int = 800) -> list:
-    text = text or ""
-    if len(text) <= chunk_chars: return [text]
-    chunks = []
-    i = 0
-    while i < len(text):
-        j = min(len(text), i + chunk_chars)
-        chunk = text[i:j]
-        chunks.append(chunk)
-        if j == len(text): break
-        i = j - overlap
-    return chunks
+def _extract_highlights(text: str, top_k: int = 10) -> list[str]:
+    bits = []
+    for rx in [MONEY_RX, PCT_RX, DATE_RX, APPROVAL_RX, CONSID_RX]:
+        bits += [m.group(0).strip() for m in rx.finditer(text or "")]
+    # de-dupe while preserving order
+    seen, out = set(), []
+    for b in bits:
+        k = b.lower()
+        if k not in seen:
+            out.append(b); seen.add(k)
+        if len(out) >= top_k: break
+    return out
 
-def openai_bullet_summarize(full_text: str, company_hint: str, headline_hint: str,
-                            model: str, api_key: str) -> str:
+def _extract_parties(text: str, self_company: str) -> list[str]:
+    names = [m.group(1).strip() for m in COMPANY_LIKE_RX.finditer(text or "")]
+    names = [n for n in names if not self_company or _norm(n).lower() != _norm(self_company).lower()]
+    # de-dupe preserving order
+    seen, out = set(), []
+    for n in names:
+        k = _norm(n).lower()
+        if k not in seen:
+            out.append(n); seen.add(k)
+    return out[:6]  # limit
+
+def summarize_to_bullets(full_text: str, company: str, headline: str, subcat: str) -> str:
     """
-    Two-pass LLM read: (1) chunk-level extraction → bullets, (2) merge → final bullets.
-    Ensures we 'read' the entire PDF content via the OpenAI library.
+    Offline NLP bullets:
+      - Company
+      - What it’s about (uses headline or best 'deal' sentence)
+      - Key features (top facts: money/percent/dates/approvals/consideration + top ranked sentences)
+      - Parties/counterparties
     """
-    if not (_HAS_OPENAI and api_key and model):
-        return "[OpenAI disabled] Provide OPENAI_API_KEY + model."
+    text = full_text or ""
+    sents = _split_sentences(text)
+    ranked_idx = _rank_sentences_tfidf(sents)
+    best_deal_sent = next((sents[i] for i in ranked_idx if KEY_VERBS.search(sents[i])), headline or "")
+    top_fact_sents = []
+    for i in ranked_idx:
+        s = sents[i]
+        if any(rx.search(s) for rx in [MONEY_RX, PCT_RX, APPROVAL_RX, DATE_RX, CONSID_RX]):
+            top_fact_sents.append(s)
+        if len(top_fact_sents) >= 5:
+            break
 
-    client = OpenAI(api_key=api_key)
+    highlights = _extract_highlights(text, top_k=10)
+    parties = _extract_parties(text, self_company=company)
 
-    sys_extract = (
-        "You are an equity research assistant reading a corporate filing (PDF text). "
-        "Extract concise bullets capturing: Company name, what the announcement is about, "
-        "key features (structure, amounts, parties, timelines, conditions, approvals), "
-        "and any risks/caveats. Be factual, 5–10 bullets. No fluff."
-    )
-    sys_merge = (
-        "You are consolidating bullet notes from multiple chunks of the same filing. "
-        "Merge and deduplicate into a single, crisp list of bullets covering: "
-        "Company, What the announcement is about, Key features (structure/amounts/timelines/approvals), "
-        "and any risks/caveats. Keep 6–12 clean bullets. Use Markdown bullets."
-    )
-
-    # 1) Per-chunk extraction
-    chunks = _chunk_text(full_text, chunk_chars=15000, overlap=800)
-    per_chunk_bullets = []
-    for idx, ch in enumerate(chunks, 1):
-        user_content = (
-            f"Company (hint): {company_hint or 'Unknown'}\n"
-            f"Headline (hint): {headline_hint or 'Unknown'}\n\n"
-            f"PDF Chunk {idx}/{len(chunks)}:\n{ch}"
-        )
-        try:
-            resp = client.chat.completions.create(
-                model=model,
-                temperature=0.2,
-                max_tokens=450,
-                messages=[
-                    {"role": "system", "content": sys_extract},
-                    {"role": "user", "content": user_content},
-                ],
-            )
-            per_chunk_bullets.append(resp.choices[0].message.content.strip())
-        except Exception as e:
-            per_chunk_bullets.append(f"[Chunk {idx} error] {e}")
-
-    # 2) Merge pass
-    merge_input = (
-        f"Company (hint): {company_hint or 'Unknown'}\n"
-        f"Headline (hint): {headline_hint or 'Unknown'}\n\n"
-        f"Combine the following bullet sets from {len(per_chunk_bullets)} chunks:\n\n" +
-        "\n\n---\n\n".join(per_chunk_bullets)
-    )
-    try:
-        final = client.chat.completions.create(
-            model=model,
-            temperature=0.2,
-            max_tokens=600,
-            messages=[
-                {"role": "system", "content": sys_merge},
-                {"role": "user", "content": merge_input},
-            ],
-        )
-        return final.choices[0].message.content.strip()
-    except Exception as e:
-        # Fallback: concatenate chunk bullets
-        return "\n\n".join(per_chunk_bullets)
+    # Build Markdown bullets
+    bullets = []
+    bullets.append(f"- **Company:** {company or 'Unknown'}")
+    bullets.append(f"- **Announcement type:** {subcat or 'N/A'}")
+    about_line = headline or (best_deal_sent.strip()[:240] + ("…" if len(best_deal_sent) > 240 else ""))
+    bullets.append(f"- **What it’s about:** {about_line}")
+    if parties:
+        bullets.append(f"- **Involved parties / entities:** " + "; ".join(parties))
+    if highlights:
+        bullets.append(f"- **Key data points:** " + "; ".join(highlights))
+    if top_fact_sents:
+        bullets.append(f"- **Key features:**")
+        for s in top_fact_sents[:5]:
+            bullets.append(f"  - {s.strip()}")
+    return "\n".join(bullets)
 
 # =========================================
 # Sidebar controls
@@ -480,18 +440,12 @@ with st.sidebar:
     ocr_max_pages = None if ocr_cap == 0 else int(ocr_cap)
 
     max_workers = st.slider("Parallel PDF downloads", 2, 16, 10)
-
-    st.divider()
-    st.subheader("OpenAI Summarization")
-    use_openai = st.checkbox("Use OpenAI to read & summarize (recommended)", value=True)
-    openai_key = st.text_input("OPENAI_API_KEY", type="password", value=os.getenv("OPENAI_API_KEY", ""))
-    openai_model = st.text_input("Model", value="gpt-4o-mini")
     max_items = st.slider("Max announcements to summarize", 5, 200, 60, step=5)
 
     run = st.button("🚀 Fetch & Analyze", type="primary")
 
 # =========================================
-# Run pipeline (fetch → PDFs → summarize)
+# Run pipeline (fetch → PDFs → NLP bullets)
 # =========================================
 def _fmt(d: datetime.date) -> str: return d.strftime("%Y%m%d")
 
@@ -505,7 +459,6 @@ if run:
     if df_hits.empty:
         st.warning("No matching announcements in this window.")
     else:
-        # Cap to avoid runaway LLM calls
         if len(df_hits) > max_items:
             df_hits = df_hits.head(max_items)
 
@@ -519,68 +472,31 @@ if run:
                 verbose=True
             )
 
-        with st.status("Summarizing…", expanded=True):
-            summaries = []
-            bullets = []
-            for _, r in df_pdf.iterrows():
-                company = str(r.get("SLONGNAME") or r.get("SNAME") or r.get("SC_NAME") or "").strip()
-                headline = str(r.get("HEADLINE") or "").strip()
-                fulltext = r.get("original_text") or ""
-                if use_openai and _HAS_OPENAI and openai_key and openai_model:
-                    out = openai_bullet_summarize(fulltext, company, headline, openai_model.strip(), openai_key.strip())
-                    bullets.append(out)
-                    summaries.append("")  # bullets are the main output
-                else:
-                    # Non-LLM fallback: TF-IDF then reformat as bullets
-                    summ = summarize_extractive_tfidf(fulltext, max_sentences=6)
-                    # Basic bulletization with hints
-                    lines = [f"- **Company:** {company or 'Unknown'}",
-                             f"- **What it’s about (from headline):** {headline or 'N/A'}",
-                             "- **Key points:**"]
-                    for sent in _split_sentences(summ)[:6]:
-                        lines.append(f"  - {sent.strip()}")
-                    bullets.append("\n".join(lines))
-                    summaries.append(summ)
+        # Build NLP bullet summaries
+        st.subheader("📑 Summaries")
+        nm = _first_col(df_pdf, ["SLONGNAME","SNAME","SC_NAME","COMPANYNAME"]) or "SLONGNAME"
+        subcol = _first_col(df_pdf, ["SUBCATEGORYNAME","SUBCATEGORY","SUB_CATEGORY","NEWS_SUBCATEGORY"]) or "SUBCATEGORYNAME"
 
-            df_pdf["summary_raw"] = summaries
-            df_pdf["summary_bullets"] = bullets
-
-        # Show & download
-        show_cols = [c for c in [
-            "NEWS_DT","SLONGNAME","HEADLINE","CATEGORYNAME","SUBCATEGORYNAME",
-            "NEWSSUB","pdf_url","NSURL","summary_bullets"
-        ] if c in df_pdf.columns]
-        st.subheader("📑 Results")
-        st.dataframe(df_pdf[show_cols], use_container_width=True, hide_index=True)
-
-        st.download_button(
-            "⬇️ Download CSV (with bullets)",
-            data=df_pdf[show_cols].to_csv(index=False).encode("utf-8"),
-            file_name=f"company_update_mna_jv_{start_str}_{end_str}.csv",
-            mime="text/csv"
-        )
-
-        # Optional: Markdown digest
-        md_lines = ["# BSE Company Update — M&A/Merger/Scheme/JV Digest", ""]
+        cnt = 0
         for _, r in df_pdf.iterrows():
+            company = str(r.get(nm) or "").strip()
+            headline = str(r.get("HEADLINE") or "").strip()
+            subcat = str(r.get(subcol) or "").strip()
+            fulltext = r.get("original_text") or " ".join([headline, str(r.get("NEWSSUB") or "")])
+            pdf_url = str(r.get("pdf_url") or r.get("NSURL") or "").strip()
             dt = str(r.get("NEWS_DT") or "").strip()
-            co = str(r.get("SLONGNAME") or "").strip()
-            hd = str(r.get("HEADLINE") or "").strip()
-            url = str(r.get("pdf_url") or r.get("NSURL") or "").strip()
-            md_lines.append(f"## {co or 'Unknown'} — {dt}")
-            if hd: md_lines.append(f"*{hd}*")
-            if url: md_lines.append(f"[PDF]({url})")
-            md_lines.append("")
-            md_lines.append(r.get("summary_bullets") or "")
-            md_lines.append("")
-        digest_md = "\n".join(md_lines)
 
-        st.download_button(
-            "⬇️ Download Markdown Digest",
-            data=digest_md.encode("utf-8"),
-            file_name=f"digest_{start_str}_{end_str}.md",
-            mime="text/markdown"
-        )
+            bullets_md = summarize_to_bullets(fulltext, company, headline, subcat)
 
+            with st.expander(f"{company or 'Unknown'} — {dt}  •  {subcat or 'N/A'}"):
+                if headline:
+                    st.markdown(f"**Headline:** {headline}")
+                if pdf_url:
+                    st.markdown(f"[PDF link]({pdf_url})")
+                st.markdown(bullets_md)
+            cnt += 1
+
+        if cnt == 0:
+            st.info("No items to show after PDF processing.")
 else:
-    st.info("Pick your date range and click **Fetch & Analyze**. Turn on OpenAI to get richer bullet summaries that read the entire PDF via the OpenAI library.")
+    st.info("Pick your date range and click **Fetch & Analyze**. This version uses offline NLP (no OpenAI) and shows bullet summaries directly on the page.")
